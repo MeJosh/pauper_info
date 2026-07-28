@@ -1,46 +1,148 @@
-name: Deploy frontend to GitHub Pages
+name: Deploy frontend branch previews to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     paths:
       - "frontend/**"
       - ".github/workflows/deploy-frontend.yml"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  # Every branch updates the same Pages artifact, so serialize publishes.
+  group: frontend-pages
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: frontend
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - run: npm ci
-      - run: npm run build
+
+      - name: Derive Pages paths
+        id: pages-paths
         env:
-          # Served from the root of the custom domain - base is "/".
-          VITE_BASE: /
-          # Cloud Run API URL; set as a repository variable (Settings → Variables).
+          PAGES_BASE_PREFIX: ${{ vars.PAGES_BASE_PREFIX }}
+        run: |
+          set -euo pipefail
+
+          raw_ref="${GITHUB_REF_NAME}"
+          slug="$(printf '%s' "$raw_ref" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9._-]+#-#g; s#^-+|-+$##g')"
+          if [ -z "$slug" ]; then
+            slug="$(git rev-parse --short HEAD)"
+          fi
+
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          base_prefix="${PAGES_BASE_PREFIX:-/$repo_name}"
+          if [ "$base_prefix" = "/" ]; then
+            base_prefix=""
+          else
+            base_prefix="/${base_prefix#/}"
+            base_prefix="${base_prefix%/}"
+          fi
+
+          if [ "$raw_ref" = "main" ]; then
+            publish_dir="."
+            vite_base="${base_prefix}/"
+          else
+            publish_dir="branches/$slug"
+            vite_base="${base_prefix}/branches/$slug/"
+          fi
+
+          {
+            echo "publish_dir=$publish_dir"
+            echo "vite_base=$vite_base"
+            echo "slug=$slug"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Branch '$raw_ref' will publish to '$publish_dir' with Vite base '$vite_base'."
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          # Existing deployed server API URL. Configure as a repository variable.
           VITE_API_BASE_URL: ${{ vars.API_BASE_URL }}
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+          VITE_BASE: ${{ steps.pages-paths.outputs.vite_base }}
+        run: npm run build
+
+      - name: Prepare Pages backing branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAGES_CNAME: ${{ vars.PAGES_CNAME }}
+          PUBLISH_DIR: ${{ steps.pages-paths.outputs.publish_dir }}
+        run: |
+          set -euo pipefail
+
+          mkdir pages-site
+          cd pages-site
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch --depth=1 origin gh-pages:gh-pages
+            git checkout gh-pages
+          else
+            git checkout --orphan gh-pages
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          if [ "$PUBLISH_DIR" = "." ]; then
+            find . -mindepth 1 -maxdepth 1 ! -name .git ! -name branches -exec rm -rf {} +
+            cp -a ../frontend/dist/. .
+          else
+            rm -rf "$PUBLISH_DIR"
+            mkdir -p "$PUBLISH_DIR"
+            cp -a ../frontend/dist/. "$PUBLISH_DIR/"
+            rm -f CNAME
+          fi
+
+          rm -f "$PUBLISH_DIR/CNAME"
+          touch .nojekyll
+
+          if [ -n "$PAGES_CNAME" ]; then
+            printf '%s\n' "$PAGES_CNAME" > CNAME
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "No Pages content changes to commit."
+          else
+            git commit -m "Publish ${GITHUB_REF_NAME} frontend preview"
+            git push origin gh-pages
+          fi
+
+          rm -rf .git
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          path: frontend/dist
+          path: pages-site
 
   deploy:
     needs: build
@@ -49,5 +151,6 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deployment
+      - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
